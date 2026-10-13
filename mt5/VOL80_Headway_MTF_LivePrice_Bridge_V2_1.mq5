@@ -2,11 +2,13 @@
 //| VOL80 Headway Historical MTF Bridge V2.00 - READ ONLY           |
 //+------------------------------------------------------------------+
 #property strict
-#property version "2.10"
+#property version "2.20"
 input string ApiUrl="https://vol80-ai-scalping-production.up.railway.app/api/mt5/candles";
 input string BridgeToken="";
 input string ApiSymbol="VOL_80";
 input int ServerUtcOffsetHours=3; // MT5 server time minus UTC; adjust DST if applicable
+input int HistoryM1=600;
+input int HistoryM3=600;
 input int HistoryM5=500;
 input int HistoryM15=500;
 input int HistoryH1=500;
@@ -54,6 +56,8 @@ void OnTimer(){SendTick();
   ok=Upload(PERIOD_H1,"H1",HistoryH1)&&ok;
   ok=Upload(PERIOD_M15,"M15",HistoryM15)&&ok;
   ok=Upload(PERIOD_M5,"M5",HistoryM5)&&ok;
+  ok=Upload(PERIOD_M3,"M3",HistoryM3)&&ok;
+  ok=Upload(PERIOD_M1,"M1",HistoryM1)&&ok;
   if(ok){backfill=false;lastM5=iTime(_Symbol,PERIOD_M5,1);Print("VOL80 MTF HISTORY IMPORT COMPLETE");}
   return;
  }
@@ -63,5 +67,7 @@ void OnTimer(){SendTick();
  ok=Upload(PERIOD_H1,"H1",30)&&ok;
  ok=Upload(PERIOD_M15,"M15",40)&&ok;
  ok=Upload(PERIOD_M5,"M5",72)&&ok;
+ ok=Upload(PERIOD_M3,"M3",120)&&ok;
+ ok=Upload(PERIOD_M1,"M1",180)&&ok;
  if(ok)lastM5=current;
 }
