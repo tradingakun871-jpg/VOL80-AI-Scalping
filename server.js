@@ -18,7 +18,7 @@ async function analyze(hour){await evaluateOutcomes();const prior=await db.query
  const unique=new Set(rows.map(x=>new Date(x.ts).getTime()));
  if(rows.length!==12||unique.size!==12||rows.some((x,i)=>new Date(x.ts).getTime()!==start+i*300000)){const state={status:"WAITING_CANDLES",hour:hour.toISOString(),received:rows.length,required:12,first:rows[0]?.ts||null,last:rows.at(-1)?.ts||null};lastRun=state;return state;}
  const candles=rows.map(x=>({time:x.ts,open:x.o,high:x.h,low:x.l,close:x.c}));
- const context={};for(const [tf,limit] of [["D1",60],["H1",120],["M15",120]]){const h=await db.query("SELECT ts,o,h,l,c FROM candles WHERE symbol=$1 AND tf=$2 AND ts < $3 ORDER BY ts DESC LIMIT $4",[SYMBOL,tf,hour,limit]);context[tf]=h.rows.reverse().map(x=>({time:x.ts,open:x.o,high:x.h,low:x.l,close:x.c}));}
+ const context={};for(const [tf,limit] of [["D1",60],["H1",120],["M15",120]]){const h=await db.query("SELECT ts,o,h,l,c FROM candles WHERE symbol=$1 AND tf=$2 AND ts < $3 ORDER BY ts DESC LIMIT $4",[SYMBOL,tf,new Date(hour.getTime()-({D1:86400000,H1:3600000,M15:900000}[tf])),limit]);context[tf]=h.rows.reverse().map(x=>({time:x.ts,open:x.o,high:x.h,low:x.l,close:x.c}));}
  const missing=Object.entries({D1:20,H1:24,M15:32}).filter(([tf,n])=>context[tf].length<n).map(([tf,n])=>({tf,received:context[tf].length,required:n}));
  if(missing.length){lastRun={status:"WAITING_MTF_HISTORY",hour:hour.toISOString(),missing};return lastRun;}
  const learning=await learningSummary();
