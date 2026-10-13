@@ -16,7 +16,7 @@ datetime lastM5=0;
 input int TickUploadSeconds=5;
 datetime lastTickSent=0;
 bool backfill=true;
-int OnInit(){EventSetTimer(30);Print("VOL80 MTF bridge started READ ONLY. Allow WebRequest to https://vol80-ai-scalping-production.up.railway.app");return INIT_SUCCEEDED;}
+int OnInit(){EventSetTimer(5);Print("VOL80 MTF bridge started READ ONLY. Allow WebRequest to https://vol80-ai-scalping-production.up.railway.app");return INIT_SUCCEEDED;}
 void OnDeinit(const int reason){EventKillTimer();}
 string Stamp(datetime t){return TimeToString(t-ServerUtcOffsetHours*3600,TIME_DATE|TIME_MINUTES)+":00Z";}
 bool Upload(ENUM_TIMEFRAMES tf,string label,int requested){
@@ -45,8 +45,8 @@ bool Upload(ENUM_TIMEFRAMES tf,string label,int requested){
  Print("VOL80 ",label," OK: ",got," closed candles uploaded");
  return true;
 }
-void SendTick(){if(BridgeToken=="")return;if(TimeLocal()-lastTickSent<TickUploadSeconds)return;MqlTick tick;if(!SymbolInfoTick(_Symbol,tick))return;string body="{\"symbol\":\""+ApiSymbol+"\",\"bid\":"+DoubleToString(tick.bid,_Digits)+",\"ask\":"+DoubleToString(tick.ask,_Digits)+",\"last\":"+DoubleToString(tick.last,_Digits)+"}";char data[],response[];StringToCharArray(body,data,0,WHOLE_ARRAY,CP_UTF8);ArrayResize(data,ArraySize(data)-1);string headers="Content-Type: application/json\r\nAuthorization: Bearer "+BridgeToken+"\r\n",replyHeaders;int code=WebRequest("POST","https://vol80-ai-scalping-production.up.railway.app/api/mt5/tick",headers,5000,data,response,replyHeaders);if(code==200)lastTickSent=TimeLocal();else Print("VOL80 tick error HTTP ",code);}
-void OnTick(){SendTick();}
+void SendTick(){if(BridgeToken=="")return;if(TimeLocal()-lastTickSent<TickUploadSeconds)return;MqlTick tick;if(!SymbolInfoTick(_Symbol,tick))return;string body="{\"symbol\":\""+ApiSymbol+"\",\"bid\":"+DoubleToString(tick.bid,_Digits)+",\"ask\":"+DoubleToString(tick.ask,_Digits)+",\"last\":"+DoubleToString(tick.last,_Digits)+"}";char data[],response[];StringToCharArray(body,data,0,WHOLE_ARRAY,CP_UTF8);ArrayResize(data,ArraySize(data)-1);string headers="Content-Type: application/json\r\nAuthorization: Bearer "+BridgeToken+"\r\n",replyHeaders;int code=WebRequest("POST","https://vol80-ai-scalping-production.up.railway.app/api/mt5/tick",headers,5000,data,response,replyHeaders);lastTickSent=TimeLocal();if(code!=200)Print("VOL80 tick error HTTP ",code);}
+void OnTick(){} // Timer handles tick uploads without blocking every incoming tick
 void OnTimer(){SendTick();
  if(BridgeToken==""){Print("VOL80 missing BridgeToken");return;}
  if(backfill){
