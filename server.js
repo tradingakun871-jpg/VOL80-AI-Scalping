@@ -68,6 +68,45 @@ async function analyze(hour){await evaluateOutcomes();const prior=await db.query
 }
 async function telegram(hour,r){const token=process.env.TELEGRAM_BOT_TOKEN,chat=process.env.TELEGRAM_CHAT_ID;if(!token||!chat)return;const msg=["VOL80 AI SCALPING • Headway",hour.toISOString(),"Decision: "+r.decision,"Entry: "+(r.entry??"-"),"SL: "+(r.stopLoss??"-"),"TP1: "+(r.takeProfit1??"-"),"TP2: "+(r.takeProfit2??"-"),"Method: "+(r.method||"-"),"Reason: "+(r.reason||"-"),"Auto-trading: OFF"].join("\n");const resp=await fetch("https://api.telegram.org/bot"+token+"/sendMessage",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chat_id:chat,text:msg})});if(!resp.ok)throw Error("Telegram HTTP "+resp.status)}
 app.get("/health",async(req,res)=>{let database=false;try{await db.query("SELECT 1");database=true}catch{}res.json({service:"VOL80-AI-Scalping",symbol:SYMBOL,database,openaiConfigured:!!ai,bridgeConfigured:!!process.env.BRIDGE_TOKEN,lastUpload,lastRun,autoTrade:false,technicalOnly:true,hourly:true,ready:database&&!!ai&&!!process.env.BRIDGE_TOKEN})});
+let poiReviewBusy=false;
+async function reviewPendingPois(){
+ if(poiReviewBusy)return;
+ poiReviewBusy=true;
+ try{
+  const {rows}=await db.query("SELECT * FROM pending_pois WHERE symbol=$1 AND status='PENDING_POI' ORDER BY signal_hour DESC LIMIT 10",[SYMBOL]);
+  for(const p of rows){
+   const age=p.reviewed_at?Date.now()-new Date(p.reviewed_at).getTime():Infinity;
+   if(age<180000)continue;
+   if(Date.now()>new Date(p.expires_at).getTime())continue;
+   const candles={};
+   for(const [tf,limit] of [["M5",36],["M15",24],["H1",12]]){const q=await db.query("SELECT ts,o,h,l,c FROM candles WHERE symbol=$1 AND tf=$2 ORDER BY ts DESC LIMIT $3",[SYMBOL,tf,limit]);candles[tf]=q.rows.reverse();}
+   const lastM5=candles.M5.at(-1);
+   if(!lastM5||Date.now()-new Date(lastM5.ts).getTime()>900000||!liveTick||Date.now()-new Date(liveTick.receivedAt).getTime()>15000)continue;
+   const side=p.side,price=side==="BUY"?liveTick.ask:liveTick.bid;
+   // A fresh retest is invalid if price has already crossed the protective level.
+   const breached=side==="BUY"?price<=p.sl||price>=p.tp2:price>=p.sl||price<=p.tp2;
+   if(breached){await db.query("UPDATE pending_pois SET status='CANCELLED',reason=$3,review_status='INVALIDATED',reviewed_at=now() WHERE symbol=$1 AND signal_hour=$2 AND status='PENDING_POI'",[SYMBOL,p.signal_hour,"Harga telah melewati SL/TP2 sebelum entry"]);continue}
+   if(!ai)continue; // unavailable AI must never be treated as a pass
+   try{
+    const answer=await ai.chat.completions.create({model:process.env.OPENAI_MODEL||"gpt-4.1-mini",temperature:0,response_format:{type:"json_object"},messages:[
+      {role:"system",content:"Audit an existing pending VOL_80 SMC POI, technical-only. Using supplied updated M5 M15 H1 candles and live quote, decide whether this specific zone is still FRESH and probability/quality score is >=75 and trend structure still supports side. A POI touched repeatedly, decisively broken, contradicted by market structure, or lacking new confirmation is not valid. Do not invent information. Respond ONLY JSON with keys valid:boolean, fresh:boolean, confidence:number (0-100 heuristic NOT calibrated statistical probability), reason:string in Indonesian. Be conservative."},
+      {role:"user",content:JSON.stringify({side:p.side,entry:p.entry,zone:[p.zone_low,p.zone_high],sl:p.sl,tp2:p.tp2,initialConfidence:p.confidence,liveBid:liveTick.bid,liveAsk:liveTick.ask,candles})}
+    ]});
+    const v=JSON.parse(answer.choices[0]?.message?.content||"{}");
+    const confidence=Number(v.confidence);
+    const valid=v.valid===true&&v.fresh===true&&Number.isFinite(confidence)&&confidence>=75;
+    const note=String(v.reason||"Evaluasi AI tidak memberikan alasan").slice(0,1500);
+    if(!valid){
+     const u=await db.query("UPDATE pending_pois SET status='CANCELLED',reason=$3,review_status='REJECTED',review_confidence=$4,reviewed_at=now(),review_note=$5 WHERE symbol=$1 AND signal_hour=$2 AND status='PENDING_POI' RETURNING signal_hour",[SYMBOL,p.signal_hour,"AI membatalkan: POI tidak fresh, struktur berubah, atau skor keyakinan di bawah 75",Number.isFinite(confidence)?confidence:null,note]);
+     if(u.rowCount)console.log("POI_AI_CANCELLED",JSON.stringify({hour:p.signal_hour,confidence,reason:note}));
+    }else{
+     await db.query("UPDATE pending_pois SET review_status='APPROVED',review_confidence=$3,reviewed_at=now(),review_note=$4 WHERE symbol=$1 AND signal_hour=$2 AND status='PENDING_POI'",[SYMBOL,p.signal_hour,confidence,note]);
+     console.log("POI_AI_APPROVED",JSON.stringify({hour:p.signal_hour,confidence}));
+    }
+   }catch(e){console.error("POI_AI_REVIEW_ERROR",e.message)}
+  }
+ }catch(e){console.error("POI_REVIEW_ERROR",e.message)}finally{poiReviewBusy=false}
+}
 let poiBusy=false;
 async function checkPoiRetests(){
  if(poiBusy||!liveTick||Date.now()-new Date(liveTick.receivedAt).getTime()>15000)return;
@@ -83,6 +122,7 @@ async function checkPoiRetests(){
     continue;
    }
    if(price<p.zone_low||price>p.zone_high)continue;
+   if(p.review_status!=="APPROVED"||!p.reviewed_at||Date.now()-new Date(p.reviewed_at).getTime()>180000)continue;
    if(!p.touched_at){await db.query("UPDATE pending_pois SET touched_at=now() WHERE symbol=$1 AND signal_hour=$2 AND touched_at IS NULL",[SYMBOL,p.signal_hour]);continue}
    for(const [tf,ms] of [["M1",60000],["M3",180000],["M5",300000]]){
     const bars=await db.query("SELECT ts,o,c FROM candles WHERE symbol=$1 AND tf=$2 ORDER BY ts DESC LIMIT 2",[SYMBOL,tf]);
@@ -127,7 +167,7 @@ out.fullChartMatchVerified=false;out.note="All database rows checked for OHLC an
 res.json(out)
 }catch(e){console.error("HISTORICAL_AUDIT_ERROR",e.message);res.status(500).json({status:"AUDIT_ERROR",error:e.message})}});
 app.get("/api/ai/price-audit",async(req,res)=>{try{const q=await db.query("SELECT hour,decision,result FROM hourly_signals WHERE symbol=$1 AND NOT (result ? 'syncInvalidated') ORDER BY hour DESC LIMIT 1",[SYMBOL]);if(!q.rows.length)return res.json({status:"NO_DECISION"});const x=q.rows[0],end=new Date(x.hour),start=new Date(end.getTime()-3600000);const c=await db.query("SELECT ts,o,h,l,c FROM candles WHERE symbol=$1 AND tf='M5' AND ts >= $2 AND ts < $3 ORDER BY ts ASC",[SYMBOL,start,end]);const bars=c.rows,entry=x.result.entry==null?null:Number(x.result.entry);const low=bars.length?Math.min(...bars.map(v=>v.l)):null,high=bars.length?Math.max(...bars.map(v=>v.h)):null;res.json({symbol:SYMBOL,decisionHourUTC:end.toISOString(),decisionHourWIB:end.toLocaleString("id-ID",{timeZone:"Asia/Jakarta"}),decision:x.decision,entry,sl:x.result.stopLoss,tp2:x.result.takeProfit2,closedM5Count:bars.length,analysisWindowUTC:{start:start.toISOString(),end:end.toISOString()},lastClosedM5:bars.at(-1)||null,windowLow:low,windowHigh:high,entryInsideM5Range:entry===null?null:low!==null&&entry>=low&&entry<=high,priceIsNotGuaranteedAtDecisionTime:true})}catch(e){res.status(500).json({error:"Price audit unavailable"})}});
-app.get("/api/signal-level",async(req,res)=>{try{const q=await db.query("SELECT signal_hour,side,entry,zone_low,zone_high,sl,tp1,tp2,confidence,poi_tf,confirmation_tf,status,expires_at,activated_at,activated_price,touched_at,reason FROM pending_pois WHERE symbol=$1 ORDER BY signal_hour DESC LIMIT 15",[SYMBOL]);res.json({symbol:SYMBOL,levels:q.rows,autoTrade:false})}catch(e){res.status(500).json({error:"Signal level unavailable"})}});
+app.get("/api/signal-level",async(req,res)=>{try{const q=await db.query("SELECT signal_hour,side,entry,zone_low,zone_high,sl,tp1,tp2,confidence,poi_tf,confirmation_tf,status,expires_at,activated_at,activated_price,touched_at,reason,review_status,review_confidence,reviewed_at,review_note FROM pending_pois WHERE symbol=$1 ORDER BY signal_hour DESC LIMIT 15",[SYMBOL]);res.json({symbol:SYMBOL,levels:q.rows,autoTrade:false})}catch(e){res.status(500).json({error:"Signal level unavailable"})}});
 app.get("/api/hourly/status",async(req,res)=>{try{const hour=hourStart(new Date());const q=await db.query("SELECT hour,decision,result FROM hourly_signals WHERE symbol=$1 AND NOT (result ? 'syncInvalidated') ORDER BY hour DESC LIMIT 1",[SYMBOL]);const previous=q.rows[0]||null;res.json({symbol:SYMBOL,expectedHourUTC:hour.toISOString(),expectedHourWIB:hour.toLocaleString("id-ID",{timeZone:TZ}),lastStoredHourUTC:previous?.hour||null,lastDecision:previous?.decision||null,decisionForCurrentHour:previous?new Date(previous.hour).getTime()===hour.getTime():false,lastAttempt:lastRun,livePriceAgeSeconds:liveTick?Math.round((Date.now()-new Date(liveTick.receivedAt).getTime())/1000):null,autoTrade:false,rule:"Evaluate hourly; BUY/SELL only when validated, otherwise NO_TRADE"})}catch(e){res.status(500).json({error:e.message})}});
 const pendingTranslations=new Map();
 async function localizedDecision(row){
@@ -175,4 +215,4 @@ const today=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Jakarta'});doc
 function cell(v){return v===null||v===undefined?'-':String(v)}
 async function load(){try{const date=document.getElementById('day').value;const [h,j]=await Promise.all([fetch('/health',{cache:'no-store'}).then(x=>x.json()),fetch('/api/journal/daily?date='+encodeURIComponent(date),{cache:'no-store'}).then(x=>x.json())]);if(j.error)throw Error(j.error);document.getElementById('health').textContent='Database: '+(h.database?'ONLINE':'OFFLINE')+' | OpenAI: '+(h.openaiConfigured?'CONFIGURED':'MISSING')+' | Bridge: '+(h.bridgeConfigured?'CONFIGURED':'MISSING')+' | Auto Trade: OFF';const m=j.stats;document.getElementById('metrics').innerHTML=Object.entries({'Winrate':m.winrate===null?'N/A':m.winrate+'%','Sinyal':m.total,'BUY':m.buy,'SELL':m.sell,'TP2':m.win,'SL':m.loss,'Pending':m.pending,'No Trade':m.noTrade,'Ambiguous':m.ambiguous}).map(([k,v])=>'<div class="metric">'+k+'<b>'+v+'</b></div>').join('');document.getElementById('journal').innerHTML='<table><tr><th>Waktu WIB</th><th>Sinyal</th><th>Confidence</th><th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>Hasil</th><th>Metode</th></tr>'+j.signals.map(x=>{const r=x.result||{};const time=new Date(x.hour).toLocaleString('id-ID',{timeZone:'Asia/Jakarta',hour12:false});return '<tr><td>'+time+'</td><td>'+cell(x.decision)+'</td><td>'+cell(r.confidence)+'</td><td>'+cell(r.entry)+'</td><td>'+cell(r.stopLoss)+'</td><td>'+cell(r.takeProfit1)+'</td><td>'+cell(r.takeProfit2)+'</td><td>'+cell(r.outcome?.status||(x.decision==='NO_TRADE'?'NO TRADE':'PENDING'))+'</td><td>'+cell(r.method)+'</td></tr>'}).join('')+'</table>'}catch(e){document.getElementById('journal').textContent='Gagal memuat: '+e.message}}load();setInterval(load,60000);
 </script></html>`));
-init().then(()=>migrateHeadwayTime()).then(()=>{app.listen(process.env.PORT||3000,"0.0.0.0",()=>console.log("VOL80 AI started"));setInterval(()=>analyze(hourStart(new Date())).catch(e=>console.error("hourly",e.message)),60000)}).catch(e=>{console.error(e);process.exit(1)});
+init().then(()=>migrateHeadwayTime()).then(()=>{app.listen(process.env.PORT||3000,"0.0.0.0",()=>console.log("VOL80 AI started"));setInterval(()=>analyze(hourStart(new Date())).catch(e=>console.error("hourly",e.message)),60000);setInterval(()=>reviewPendingPois().catch(e=>console.error("poi review",e.message)),60000);setTimeout(()=>reviewPendingPois().catch(e=>console.error("poi review",e.message)),12000)}).catch(e=>{console.error(e);process.exit(1)});
