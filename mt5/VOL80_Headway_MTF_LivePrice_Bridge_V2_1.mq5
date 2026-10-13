@@ -6,7 +6,7 @@
 input string ApiUrl="https://vol80-ai-scalping-production.up.railway.app/api/mt5/candles";
 input string BridgeToken="";
 input string ApiSymbol="VOL_80";
-input int ServerUtcOffsetHours=0; // MT5 server time minus UTC; adjust DST if applicable
+input int ServerUtcOffsetHours=3; // MT5 server time minus UTC; adjust DST if applicable
 input int HistoryM5=500;
 input int HistoryM15=500;
 input int HistoryH1=500;
