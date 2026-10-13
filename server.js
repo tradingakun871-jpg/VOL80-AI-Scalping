@@ -68,7 +68,36 @@ async function analyze(hour){await evaluateOutcomes();const prior=await db.query
 }
 async function telegram(hour,r){const token=process.env.TELEGRAM_BOT_TOKEN,chat=process.env.TELEGRAM_CHAT_ID;if(!token||!chat)return;const msg=["VOL80 AI SCALPING • Headway",hour.toISOString(),"Decision: "+r.decision,"Entry: "+(r.entry??"-"),"SL: "+(r.stopLoss??"-"),"TP1: "+(r.takeProfit1??"-"),"TP2: "+(r.takeProfit2??"-"),"Method: "+(r.method||"-"),"Reason: "+(r.reason||"-"),"Auto-trading: OFF"].join("\n");const resp=await fetch("https://api.telegram.org/bot"+token+"/sendMessage",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chat_id:chat,text:msg})});if(!resp.ok)throw Error("Telegram HTTP "+resp.status)}
 app.get("/health",async(req,res)=>{let database=false;try{await db.query("SELECT 1");database=true}catch{}res.json({service:"VOL80-AI-Scalping",symbol:SYMBOL,database,openaiConfigured:!!ai,bridgeConfigured:!!process.env.BRIDGE_TOKEN,lastUpload,lastRun,autoTrade:false,technicalOnly:true,hourly:true,ready:database&&!!ai&&!!process.env.BRIDGE_TOKEN})});
-app.post("/api/mt5/tick",authorized,(req,res)=>{const {symbol,bid,ask,last}=req.body||{};const b=Number(bid),a=Number(ask),l=Number(last);if(symbol!==SYMBOL||!Number.isFinite(b)||!Number.isFinite(a)||b<=0||a<=0||a<b)return res.status(400).json({error:"Invalid tick"});liveTick={symbol:SYMBOL,bid:b,ask:a,last:Number.isFinite(l)&&l>0?l:null,receivedAt:new Date().toISOString(),source:"Headway MT5"};res.json({ok:true})});
+let poiBusy=false;
+async function checkPoiRetests(){
+ if(poiBusy||!liveTick||Date.now()-new Date(liveTick.receivedAt).getTime()>15000)return;
+ poiBusy=true;
+ try{
+  const q=await db.query("SELECT * FROM pending_pois WHERE symbol=$1 AND status='PENDING_POI' ORDER BY signal_hour DESC LIMIT 10",[SYMBOL]);
+  for(const p of q.rows){
+   const price=p.side==="BUY"?liveTick.ask:liveTick.bid;
+   const expired=Date.now()>new Date(p.expires_at).getTime();
+   const invalid=p.side==="BUY"?price<=p.sl||price>=p.tp2:price>=p.sl||price<=p.tp2;
+   if(expired||invalid){
+    await db.query("UPDATE pending_pois SET status='CANCELLED',reason=$3 WHERE symbol=$1 AND signal_hour=$2 AND status='PENDING_POI'",[SYMBOL,p.signal_hour,expired?"Kedaluwarsa":"SL atau TP2 terlewati sebelum entry"]);
+    continue;
+   }
+   if(price<p.zone_low||price>p.zone_high)continue;
+   for(const [tf,ms] of [["M1",60000],["M3",180000],["M5",300000]]){
+    const bars=await db.query("SELECT ts,o,c FROM candles WHERE symbol=$1 AND tf=$2 ORDER BY ts DESC LIMIT 2",[SYMBOL,tf]);
+    if(bars.rows.length<2)continue;
+    const a=bars.rows[0],b=bars.rows[1],age=Date.now()-new Date(a.ts).getTime();
+    if(age<ms||age>ms+360000)continue;
+    const confirmed=p.side==="BUY"?a.c>a.o&&a.c>b.c:a.c<a.o&&a.c<b.c;
+    if(!confirmed)continue;
+    const u=await db.query("UPDATE pending_pois SET status='ACTIVE',activated_at=now(),activated_price=$3,confirmation_tf=$4 WHERE symbol=$1 AND signal_hour=$2 AND status='PENDING_POI' RETURNING signal_hour",[SYMBOL,p.signal_hour,price,tf]);
+    if(u.rowCount)console.log("POI_LEVEL_ACTIVATED",JSON.stringify({side:p.side,entry:price,tf,zone:[p.zone_low,p.zone_high]}));
+    break;
+   }
+  }
+ }catch(e){console.error("POI_RETEST_ERROR",e.message)}finally{poiBusy=false}
+}
+app.post("/api/mt5/tick",authorized,(req,res)=>{const {symbol,bid,ask,last}=req.body||{};const b=Number(bid),a=Number(ask),l=Number(last);if(symbol!==SYMBOL||!Number.isFinite(b)||!Number.isFinite(a)||b<=0||a<=0||a<b)return res.status(400).json({error:"Invalid tick"});liveTick={symbol:SYMBOL,bid:b,ask:a,last:Number.isFinite(l)&&l>0?l:null,receivedAt:new Date().toISOString(),source:"Headway MT5"};res.json({ok:true});checkPoiRetests().catch(e=>console.error("POI_TICK",e.message))});
 app.get("/api/price/live",(req,res)=>{if(!liveTick)return res.json({symbol:SYMBOL,status:"WAITING_TICK",bid:null,ask:null,receivedAt:null});const ageSeconds=Math.round((Date.now()-new Date(liveTick.receivedAt).getTime())/1000);res.json({...liveTick,ageSeconds,status:ageSeconds<=45?"LIVE":"STALE"})});
 app.post("/api/mt5/candles",authorized,async(req,res)=>{try{const {symbol,tf,candles}=req.body;if(symbol!==SYMBOL||!["M1","M3","M5","M15","H1","H4","D1"].includes(tf)||!Array.isArray(candles)||candles.length>500)return res.status(400).json({error:"Invalid symbol/timeframe/candles"});let n=0;let firstAccepted=null,lastAccepted=null;for(const c of candles){const ts=new Date(c.time);if(req.body.utcOffsetApplied===true){/* already UTC */}else{ts.setTime(ts.getTime()-10800000)};if(!Number.isFinite(ts.getTime())||ts.getTime()>Date.now()-({M1:60000,M3:180000,M5:300000,M15:900000,H1:3600000,H4:14400000,D1:86400000}[tf])-1000||!priceOk(c))continue;await db.query("INSERT INTO candles(symbol,tf,ts,o,h,l,c) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",[SYMBOL,tf,ts,c.open,c.high,c.low,c.close]);n++;if(!firstAccepted||ts<firstAccepted)firstAccepted=ts;if(!lastAccepted||ts>lastAccepted)lastAccepted=ts;}lastUpload={receivedAt:new Date().toISOString(),accepted:n,first:firstAccepted?.toISOString()||null,last:lastAccepted?.toISOString()||null,tf,symbol};console.log("MT5_CANDLES_ACCEPTED",JSON.stringify(lastUpload));res.json({accepted:n,first:lastUpload.first,last:lastUpload.last})}catch(e){res.status(500).json({error:e.message})}});
 app.post("/api/hourly/run",authorized,async(req,res)=>{try{res.json(await analyze(hourStart(new Date())))}catch(e){res.status(500).json({error:e.message})}});
@@ -97,6 +126,7 @@ out.fullChartMatchVerified=false;out.note="All database rows checked for OHLC an
 res.json(out)
 }catch(e){console.error("HISTORICAL_AUDIT_ERROR",e.message);res.status(500).json({status:"AUDIT_ERROR",error:e.message})}});
 app.get("/api/ai/price-audit",async(req,res)=>{try{const q=await db.query("SELECT hour,decision,result FROM hourly_signals WHERE symbol=$1 AND NOT (result ? 'syncInvalidated') ORDER BY hour DESC LIMIT 1",[SYMBOL]);if(!q.rows.length)return res.json({status:"NO_DECISION"});const x=q.rows[0],end=new Date(x.hour),start=new Date(end.getTime()-3600000);const c=await db.query("SELECT ts,o,h,l,c FROM candles WHERE symbol=$1 AND tf='M5' AND ts >= $2 AND ts < $3 ORDER BY ts ASC",[SYMBOL,start,end]);const bars=c.rows,entry=x.result.entry==null?null:Number(x.result.entry);const low=bars.length?Math.min(...bars.map(v=>v.l)):null,high=bars.length?Math.max(...bars.map(v=>v.h)):null;res.json({symbol:SYMBOL,decisionHourUTC:end.toISOString(),decisionHourWIB:end.toLocaleString("id-ID",{timeZone:"Asia/Jakarta"}),decision:x.decision,entry,sl:x.result.stopLoss,tp2:x.result.takeProfit2,closedM5Count:bars.length,analysisWindowUTC:{start:start.toISOString(),end:end.toISOString()},lastClosedM5:bars.at(-1)||null,windowLow:low,windowHigh:high,entryInsideM5Range:entry===null?null:low!==null&&entry>=low&&entry<=high,priceIsNotGuaranteedAtDecisionTime:true})}catch(e){res.status(500).json({error:"Price audit unavailable"})}});
+app.get("/api/signal-level",async(req,res)=>{try{const q=await db.query("SELECT signal_hour,side,entry,zone_low,zone_high,sl,tp1,tp2,confidence,poi_tf,confirmation_tf,status,expires_at,activated_at,activated_price,reason FROM pending_pois WHERE symbol=$1 ORDER BY signal_hour DESC LIMIT 15",[SYMBOL]);res.json({symbol:SYMBOL,levels:q.rows,autoTrade:false})}catch(e){res.status(500).json({error:"Signal level unavailable"})}});
 app.get("/api/hourly/status",async(req,res)=>{try{const hour=hourStart(new Date());const q=await db.query("SELECT hour,decision,result FROM hourly_signals WHERE symbol=$1 AND NOT (result ? 'syncInvalidated') ORDER BY hour DESC LIMIT 1",[SYMBOL]);const previous=q.rows[0]||null;res.json({symbol:SYMBOL,expectedHourUTC:hour.toISOString(),expectedHourWIB:hour.toLocaleString("id-ID",{timeZone:TZ}),lastStoredHourUTC:previous?.hour||null,lastDecision:previous?.decision||null,decisionForCurrentHour:previous?new Date(previous.hour).getTime()===hour.getTime():false,lastAttempt:lastRun,livePriceAgeSeconds:liveTick?Math.round((Date.now()-new Date(liveTick.receivedAt).getTime())/1000):null,autoTrade:false,rule:"Evaluate hourly; BUY/SELL only when validated, otherwise NO_TRADE"})}catch(e){res.status(500).json({error:e.message})}});
 const pendingTranslations=new Map();
 async function localizedDecision(row){
