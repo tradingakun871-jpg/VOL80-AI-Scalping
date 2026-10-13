@@ -56,7 +56,7 @@ for(const [tf,ms] of Object.entries({M5:300000,M15:900000,H1:3600000,D1:86400000
 const q=await db.query(`WITH ordered AS (SELECT ts,o,h,l,c,LAG(ts) OVER(ORDER BY ts) AS prev FROM candles WHERE symbol=$1 AND tf=$2)
 SELECT COUNT(*)::int AS total,MIN(ts) AS first,MAX(ts) AS last,
 COUNT(*) FILTER(WHERE o IS NULL OR h IS NULL OR l IS NULL OR c IS NULL OR NOT (h>=GREATEST(o,c) AND l<=LEAST(o,c) AND l<=h))::int AS invalid,
-COUNT(*) FILTER(WHERE MOD(EXTRACT(EPOCH FROM ts)::bigint-$4,$3)<>0)::int AS misaligned,
+COUNT(*) FILTER(WHERE MOD(EXTRACT(EPOCH FROM ts)::bigint-$4,($3::bigint/1000))<>0)::int AS misaligned,
 COUNT(*) FILTER(WHERE prev IS NOT NULL AND ts-prev>($3*INTERVAL '1 millisecond'))::int AS gaps,
 MAX(c) FILTER(WHERE ts=(SELECT MAX(ts) FROM candles WHERE symbol=$1 AND tf=$2)) AS last_close FROM ordered`,[SYMBOL,tf,ms,tf==="D1"?75600:0]);
 const d=q.rows[0],last=d.last?new Date(d.last):null,age=last?Math.round((now-last.getTime())/1000):null,stale=!last||age>({M5:900,M15:2400,H1:10800,D1:259200}[tf]);
