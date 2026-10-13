@@ -26,7 +26,7 @@ bool Upload(ENUM_TIMEFRAMES tf,string label,int requested){
  if(got<1){Print("VOL80 ",label," no history ",GetLastError());return false;}
  int batch=MathMin(MathMax(BatchSize,12),400);
  for(int start=0;start<got;start+=batch){
-  string body="{\"symbol\":\""+ApiSymbol+"\",\"tf\":\""+label+"\",\"candles\":[";
+  string body="{\"symbol\":\""+ApiSymbol+"\",\"tf\":\""+label+"\",\"utcOffsetApplied\":true,\"candles\":[";
   int stop=MathMin(start+batch,got);
   for(int i=start;i<stop;i++){
    if(i>start)body+=",";
