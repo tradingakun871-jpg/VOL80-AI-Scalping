@@ -1,0 +1,2 @@
+# VOL80 AI Scalping
+Independent Headway Real VOL_80 technical-only hourly AI signal service. Auto-trading is disabled. Configure DATABASE_URL, OPENAI_API_KEY, BRIDGE_TOKEN and MT5_SYMBOL on Railway. Bridge sends closed M5 candles to POST /api/mt5/candles; an authorized scheduler calls POST /api/hourly/run at the start of each UTC hour. No market orders are placed. This is a new minimal implementation, not a verified 1:1 clone of Web1.
